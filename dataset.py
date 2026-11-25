@@ -92,8 +92,8 @@ class TextureEnhancer:
         return self.enhance_texture(img)
 
 class HEDJitter(object):
-    def __init__(self, theta_alpha, theta_betti):
-        self.hed_jitter = myTransforms.HEDJitter(theta_alpha = theta_alpha, theta_betti=theta_betti)
+    def __init__(self, theta_alpha, theta_betti, symmetric=False):
+        self.hed_jitter = myTransforms.HEDJitter(theta_alpha = theta_alpha, theta_betti=theta_betti, symmetric=symmetric)
         self.random_elastic = myTransforms.RandomElastic(alpha=2, sigma=0.06)
         self.random_affine = myTransforms.RandomAffineCV2(alpha=0.1)
 
@@ -185,8 +185,8 @@ def get_datasets(dataset_name, train_centers=None, augmentations=None, resize_si
     
     elif dataset_name == "kather":
         train_dataset_hf, val_id_dataset_hf = load_train_19_data("./data/kather/train_19")
-        val_ood_dataset_hf = load_test_16_data("./data/kather/test_16")
-        test_dataset_hf = load_test_16_data("./data/kather/test_16")
+        test_16_hf = load_test_16_data("./data/kather/test_16").train_test_split(test_size=0.8, seed=111)
+        val_ood_dataset_hf, test_dataset_hf = test_16_hf['train'], test_16_hf['test']
         print(f"Filtered Dataset Sizes:\n"
             f"  - Train dataset: {len(train_dataset_hf)} examples\n"
             f"  - Validation (ID) dataset: {len(val_id_dataset_hf)} examples\n"
@@ -314,9 +314,9 @@ def prepare_dataset(folder, center_value, train_split_ratio=0.8):
     val_centers = []
     
     # 遍历每个类别的文件夹
-    for label, class_folder in enumerate(os.listdir(folder)):
+    for label, class_folder in enumerate(sorted(os.listdir(folder))):
         class_path = os.path.join(folder, class_folder)
-        images = os.listdir(class_path)
+        images = sorted(os.listdir(class_path))
         
         # 随机打乱图像列表
         random.shuffle(images)
@@ -368,9 +368,9 @@ def load_test_16_data(test_path):
     test_labels = []
     test_centers = []
     
-    for label, class_folder in enumerate(os.listdir(test_path)):
+    for label, class_folder in enumerate(sorted(os.listdir(test_path))):
         class_path = os.path.join(test_path, class_folder)
-        images = os.listdir(class_path)
+        images = sorted(os.listdir(class_path))
         
         for img in images:
             image_path = os.path.join(class_path, img)

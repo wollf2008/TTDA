@@ -1323,22 +1323,10 @@ class HEDJitter(object):
          betti is chosen from a uniform distribution [-theta, theta]
          the jitter formula is **s' = \alpha * s + \betti**
     """
-    def __init__(self, theta_alpha=0., theta_betti=0.): # HED_light: theta=0.05; HED_strong: theta=0.2
+    def __init__(self, theta_alpha=0., theta_betti=0., symmetric=False): # HED_light: theta=0.05; HED_strong: theta=0.2
         self.theta_alpha = theta_alpha
         self.theta_betti = theta_betti
-
-        # 根据 theta 的正负选择采样区间
-        if theta_alpha >= 0:
-            self.alpha = np.random.uniform(1, 1 + theta_alpha, (1, 3))
-        else:
-            self.alpha = np.random.uniform(1 + theta_alpha, 1, (1, 3))
-
-        if theta_betti >= 0:
-            self.betti = np.random.uniform(0, theta_betti, (1, 3))
-        else:
-            self.betti = np.random.uniform(theta_betti, 0, (1, 3))
-        # self.alpha = np.random.uniform(1 - theta_alpha, 1 + theta_alpha, (1, 3))
-        # self.betti = np.random.uniform(-theta_betti, theta_betti, (1, 3))
+        self.symmetric = symmetric
 
     @staticmethod
     def adjust_HED(img, alpha, betti):
@@ -1350,18 +1338,27 @@ class HEDJitter(object):
 
         imin = nimg.min()
         imax = nimg.max()
-        rsimg = (255 * (nimg - imin) / (imax - imin)).astype('uint8')  # rescale to [0,255]
+        if imax > imin:
+            nimg = (nimg - imin) / (imax - imin)
+        rsimg = (255 * nimg).astype('uint8')  # rescale to [0,255]
         # transfer to PIL image
         return Image.fromarray(rsimg)
 
     def __call__(self, img):
-        return self.adjust_HED(img, self.alpha, self.betti)
+        ta, tb = self.theta_alpha, self.theta_betti
+        if self.symmetric:
+            alpha = np.random.uniform(1 - ta, 1 + ta, (1, 3))
+            betti = np.random.uniform(-tb, tb, (1, 3))
+        else:
+            alpha = np.random.uniform(min(1, 1 + ta), max(1, 1 + ta), (1, 3))
+            betti = np.random.uniform(min(0, tb), max(0, tb), (1, 3))
+        return self.adjust_HED(img, alpha, betti)
 
     def __repr__(self):
         format_string = self.__class__.__name__ + '('
-        format_string += 'theta={0}'.format(self.theta_alpha)
-        format_string += ',alpha={0}'.format(self.alpha)
-        format_string += ',betti={0}'.format(self.betti)
+        format_string += 'theta_alpha={0}'.format(self.theta_alpha)
+        format_string += ',theta_betti={0}'.format(self.theta_betti)
+        format_string += ',symmetric={0})'.format(self.symmetric)
         return format_string
 
 

@@ -76,6 +76,9 @@ def evaluate_models(models, dataloaders, style_encoder, generator, device):
             device=device
         )
 
+        if generator is None:
+            continue
+
         # With TTA evaluation
         metrics['with_tta'][split_name] = evaluate_with_tta(
             classifiers=models,
@@ -136,7 +139,7 @@ def attention_consistency_loss(attention_maps):
     
     # 计算平均损失
     num_pairs = num_models * (num_models - 1) / 2  # 模型对的数量
-    avg_loss = total_loss / (num_pairs * 3)
+    avg_loss = total_loss / (num_pairs * 4)
     return avg_loss
 
 class AttentionExtractor(torch.nn.Module):
@@ -178,7 +181,7 @@ def compute_classification_alignment_loss(network_outputs):
             alignment_loss += nn.functional.kl_div(nn.functional.log_softmax(network_outputs[i], dim=1), nn.functional.softmax(network_outputs[j], dim=1), reduction='batchmean')
     return alignment_loss
 
-def train_model(models, style_aug, criterion, optimizer, schedulers, data_loader, device):
+def train_model(models, mode, criterion, optimizers, schedulers, data_loader, device):
     num_models = len(models)
     running_loss = [0.0] * num_models
     total_model_loss = [0.0] * num_models
@@ -207,10 +210,14 @@ def train_model(models, style_aug, criterion, optimizer, schedulers, data_loader
         outputs_2 = []
 
         #####################
-        domain = np.zeros((5, 16), dtype=int)
-        for i in range(16):
+        batch_size = labels.size(0)
+        domain = np.zeros((5, batch_size), dtype=int)
+        for i in range(batch_size):
             domain[:, i] = np.random.permutation(5)
         domain = torch.from_numpy(domain).to(device, non_blocking=True)
+        sample_idx = torch.arange(batch_size, device=device)
+        views_1 = torch.stack([view[0] for view in augmented_images])
+        views_2 = torch.stack([view[1] for view in augmented_images])
         #####################
 
         ##############################################
@@ -225,24 +232,17 @@ def train_model(models, style_aug, criterion, optimizer, schedulers, data_loader
 
         for model_idx, model in enumerate(models):
             model.train()
-            # domain = domains[model_idx].to(device, non_blocking=True)
-            images1, images2 = augmented_images[0]
-            d = domain[model_idx]
-            with torch.no_grad():
-                x_adv_1, y_adv = style_aug(images1,  labels, d)
-                x_adv_2, y_adv = style_aug(images2,  labels, d)
+            if mode == 'baseline':
+                images1, images2 = augmented_images[1 + model_idx]
+            else:
+                d = domain[model_idx]
+                images1, images2 = views_1[d, sample_idx], views_2[d, sample_idx]
 
-            x_adv_1 = (x_adv_1 + 1)/2
-            x_adv_2 = (x_adv_2 + 1)/2
-            x_adv_1 = x_adv_1.float()
-            x_adv_2 = x_adv_2.float()
-            # if len(images1) >1 :
-            #     save_comparison_images(images1, x_adv_1, batch_idx=domain[0])
-
-            x_adv_1, x_adv_2 =  images1, images2 
+            x_adv_1 = (images1 + 1)/2
+            x_adv_2 = (images2 + 1)/2
             output1, output2 = model(x_adv_1), model(x_adv_2)
-            outputs_1.append(nn.functional.softmax(output1, dim = -1))
-            outputs_2.append(nn.functional.softmax(output2, dim = -1))
+            outputs_1.append(output1)
+            outputs_2.append(output2)
             loss = (criterion(output1, labels)+ criterion(output2, labels))/2
             losses.append(loss)
 
@@ -254,6 +254,8 @@ def train_model(models, style_aug, criterion, optimizer, schedulers, data_loader
             correct[model_idx] += ((predicted1 == labels).sum().item()+(predicted2 == labels).sum().item())/2
 
             # 提取注意力图
+            if mode == 'baseline':
+                continue
             attention_extractor = AttentionExtractor(model)
             attention_map_1 = attention_extractor(x_adv_1)  # 计算激活
             attention_map_2 = attention_extractor(x_adv_2)  # 计算激活
@@ -270,22 +272,14 @@ def train_model(models, style_aug, criterion, optimizer, schedulers, data_loader
                 'block4': attention_map_2['block4']
             }
 
-        for model_idx, attention_maps in enumerate(attention_maps_1):
-            for block_name, attention_map in attention_maps.items():
-                # 生成保存的文件路径
-                filename = f'./results/model_{model_idx}_{block_name}_attention_map.png'
-                # 调用保存函数
-                save_attention_heatmap(attention_map[0], filename)
-
-        print("Attention maps have been saved to ./results.")
-        sys.exit("Program terminated.")
-        
-        consistency_loss_1 = attention_consistency_loss(attention_maps_1)
-        consistency_loss_2 = attention_consistency_loss(attention_maps_2)
-        consistency_loss = (consistency_loss_1 + consistency_loss_2)/2
-        classification_alignment_loss_1 = compute_classification_alignment_loss(outputs_1)
-        classification_alignment_loss_2 = compute_classification_alignment_loss(outputs_2)
-        classification_alignment_loss= (classification_alignment_loss_1 + classification_alignment_loss_2)/2
+        consistency_loss = classification_alignment_loss = torch.zeros((), device=device)
+        if mode != 'baseline':
+            consistency_loss_1 = attention_consistency_loss(attention_maps_1)
+            consistency_loss_2 = attention_consistency_loss(attention_maps_2)
+            consistency_loss = (consistency_loss_1 + consistency_loss_2)/2
+            classification_alignment_loss_1 = compute_classification_alignment_loss(outputs_1)
+            classification_alignment_loss_2 = compute_classification_alignment_loss(outputs_2)
+            classification_alignment_loss= (classification_alignment_loss_1 + classification_alignment_loss_2)/2
         # 合并总的对齐损失
         alignment_loss_all = consistency_loss + classification_alignment_loss*10
 
@@ -303,13 +297,14 @@ def train_model(models, style_aug, criterion, optimizer, schedulers, data_loader
             optimizer.zero_grad()  # 清空梯度
 
             # 累加模型总损失
-            total_model_loss[model_idx] += losses[model_idx]
+            total_model_loss[model_idx] += model_loss
+            running_loss[model_idx] += model_loss
 
         # 更新进度条，显示各个损失
         progress_bar.set_postfix(
             L=[round(total_loss.item(), 4)],  # 用 batch 数计算平均损失
             A=[round(c / t * 100, 1) if t > 0 else 0 for c, t in zip(correct, total)],  # 准确率保留1位小数
-            ML=[round(ml.item() / b, 2) if b > 0 else 0 for ml, b in zip(total_model_loss, num_batches)],  # 模型损失保留2位小数
+            ML=[round(ml / b, 2) if b > 0 else 0 for ml, b in zip(total_model_loss, num_batches)],  # 模型损失保留2位小数
             CL=[round(consistency_loss.item(), 4)], # 一致性损失保留2位小数
             CA=[round(classification_alignment_loss.item(), 4)] 
         )
@@ -329,6 +324,7 @@ def train_model(models, style_aug, criterion, optimizer, schedulers, data_loader
 if __name__ == "__main__":
     args = {
         'dataset': 'camelyon17',  # 'kather' or 'camelyon17'
+        'mode': 'ours',
         'train_centers': [0], 
         'batch_size': 16,
         'num_workers': 8,
@@ -337,6 +333,8 @@ if __name__ == "__main__":
         'resize_size': 128,  # Resize input image to 128*128
         'num_class':2
     }
+    if args['dataset'] == 'kather':
+        args['num_class'] = 7
 
 
     def set_seed(seed):
@@ -350,20 +348,18 @@ if __name__ == "__main__":
         torch.backends.cudnn.benchmark = False
     set_seed(111)
 
-    augmentations = [
-        transforms.Compose([HEDJitter(0.05,-0.05)]),
-        transforms.Compose([HEDJitter(0.05,0.05)]),
-        transforms.Compose([HEDJitter(-0.05,0.05)]),
-        transforms.Compose([HEDJitter(-0.05,-0.05)])]
-
-    # augmentations = [
-    #     transforms.Compose([HEDJitter(0.05,0.05)]),
-    #     transforms.Compose([HEDJitter(0.05,0.05)]),
-    #     transforms.Compose([HEDJitter(0.05,0.05)]),
-    #     transforms.Compose([HEDJitter(0.05,0.05)])]
+    if args['mode'] == 'baseline':
+        augmentations = [transforms.Compose([HEDJitter(0.05, 0.05, symmetric=True)]) for _ in range(5)]
+    else:
+        augmentations = [
+            transforms.Compose([HEDJitter(0.05,-0.05)]),
+            transforms.Compose([HEDJitter(0.05,0.05)]),
+            transforms.Compose([HEDJitter(-0.05,0.05)]),
+            transforms.Compose([HEDJitter(-0.05,-0.05)])]
 
     # 从文件中读取 start_epoch
-    checkpoint_dir = 'checkpoints'
+    exp_name = f"{args['dataset']}_{args['mode']}"
+    checkpoint_dir = os.path.join('checkpoints', exp_name)
     os.makedirs(checkpoint_dir, exist_ok=True)
     start_epoch_file = os.path.join(checkpoint_dir, 'start_epoch.txt')
 
@@ -398,65 +394,64 @@ if __name__ == "__main__":
     schedulers = [lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda) for optimizer in optimizers]
 
     best_model_all = None
-    best_val_ood_acc_all = 0.0
-    best_model_path_all = 'checkpoints/best_model_all.pth'
+    best_val_ood_acc_all = best_val_ood_acc
+    best_model_path_all = os.path.join(checkpoint_dir, 'best_model_all.pth')
+    last_model_path_all = os.path.join(checkpoint_dir, 'last_model_all.pth')
 
 
     # 如果 start_epoch 不为 0，则加载保存的 training_models 参数
-    if start_epoch > 0 and os.path.exists(best_model_path_all):
-        model_states = torch.load(best_model_path_all, map_location=device)
+    if start_epoch > 0 and os.path.exists(last_model_path_all):
+        last_state = torch.load(last_model_path_all, map_location=device)
         for i, model in enumerate(training_models):
-            model.load_state_dict(model_states[f'model_{i+1}'])
+            model.load_state_dict(last_state['models'][i])
+            optimizers[i].load_state_dict(last_state['optimizers'][i])
+            schedulers[i].load_state_dict(last_state['schedulers'][i])
     elif start_epoch > 0:
         print("未找到合适模型的检查点文件，无法继续训练")
         exit()
 
 
     # Load image to image translation model
-    i2i_chkpt_path = './checkpoints/starganv2_camelyon17.pth'
-    i2i_chkpt = torch.load(
-        i2i_chkpt_path)
-    i2i_hyperparams = i2i_chkpt["hyperparameters"]
-    print("Loading pretrained StarGanV2 model...")
+    i2i_chkpt_path = f"./checkpoints/starganv2_{args['dataset']}.pth"
+    style_encoder = generator = None
+    if os.path.exists(i2i_chkpt_path):
+        i2i_chkpt = torch.load(
+            i2i_chkpt_path)
+        i2i_hyperparams = i2i_chkpt["hyperparameters"]
+        print("Loading pretrained StarGanV2 model...")
 
-    style_encoder = StyleEncoder(
-        img_size=i2i_hyperparams["IMG_SIZE"],
-        style_dim=i2i_hyperparams["STYLE_DIM"],
-        num_domains=i2i_hyperparams["NUM_DOMAINS"]).to(device)
-    mapping_network = MappingNetwork(
-        style_dim=i2i_hyperparams["STYLE_DIM"],
-        num_domains=i2i_hyperparams["NUM_DOMAINS"]).to(device)
-    generator = Generator(
-        img_size=i2i_hyperparams["IMG_SIZE"],
-        style_dim=i2i_hyperparams["STYLE_DIM"],
-        use_sn=False).to(device)
-    style_encoder = EMA(
-        style_encoder, decay=i2i_hyperparams["EMA_DECAY"]).eval()
-    mapping_network = EMA(
-        mapping_network, decay=i2i_hyperparams["EMA_DECAY"]).eval()
-    generator = EMA(generator, decay=i2i_hyperparams["EMA_DECAY"]).eval()
-    style_encoder.load_state_dict(i2i_chkpt["networks"]["S_EMA"])
-    mapping_network.load_state_dict(i2i_chkpt["networks"]["M_EMA"])
-    generator.load_state_dict(i2i_chkpt["networks"]["G_EMA"])
-    style_encoder = style_encoder.ema_model
-    mapping_network = mapping_network.ema_model
-    generator = generator.ema_model
-    style_aug = StyleAugMix(
-        generator=generator,
-        mapping_network=mapping_network,
-        style_encoder=style_encoder,
-        num_styles=2,
-        device=device).to(device).eval()
+        style_encoder = StyleEncoder(
+            img_size=i2i_hyperparams["IMG_SIZE"],
+            style_dim=i2i_hyperparams["STYLE_DIM"],
+            num_domains=i2i_hyperparams["NUM_DOMAINS"]).to(device)
+        mapping_network = MappingNetwork(
+            style_dim=i2i_hyperparams["STYLE_DIM"],
+            num_domains=i2i_hyperparams["NUM_DOMAINS"]).to(device)
+        generator = Generator(
+            img_size=i2i_hyperparams["IMG_SIZE"],
+            style_dim=i2i_hyperparams["STYLE_DIM"],
+            use_sn=False).to(device)
+        style_encoder = EMA(
+            style_encoder, decay=i2i_hyperparams["EMA_DECAY"]).eval()
+        mapping_network = EMA(
+            mapping_network, decay=i2i_hyperparams["EMA_DECAY"]).eval()
+        generator = EMA(generator, decay=i2i_hyperparams["EMA_DECAY"]).eval()
+        style_encoder.load_state_dict(i2i_chkpt["networks"]["S_EMA"])
+        mapping_network.load_state_dict(i2i_chkpt["networks"]["M_EMA"])
+        generator.load_state_dict(i2i_chkpt["networks"]["G_EMA"])
+        style_encoder = style_encoder.ema_model
+        mapping_network = mapping_network.ema_model
+        generator = generator.ema_model
 
-    if "prototypes" in i2i_chkpt:
-        mapping_network.prototypes = i2i_chkpt["prototypes"]["mapping_prototypes"]
-        style_encoder.prototypes = i2i_chkpt["prototypes"]["style_encoder_prototypes"]
+        if "prototypes" in i2i_chkpt:
+            mapping_network.prototypes = i2i_chkpt["prototypes"]["mapping_prototypes"]
+            style_encoder.prototypes = i2i_chkpt["prototypes"]["style_encoder_prototypes"]
 
     for epoch in range(start_epoch,args['num_epochs']):
         print(f"Epoch {epoch+1}/{args['num_epochs']}")
 
         # Train each model with its corresponding data
-        train_model(training_models, style_aug, criterion, optimizers, schedulers, train_loader, device)
+        train_model(training_models, args['mode'], criterion, optimizers, schedulers, train_loader, device)
 
         # 评估 training_models
         metrics_training = evaluate_models(
@@ -466,7 +461,7 @@ if __name__ == "__main__":
             generator=generator,
             device=device
         )
-        save_results(metrics_training, "training_models")
+        save_results(metrics_training, exp_name)
 
         # 从 metrics 中提取 val_id 和 val_ood 的无 TTA 准确率
         val_id_acc_all = metrics_training['without_tta']['Validation ID'][0]['acc']
@@ -478,6 +473,10 @@ if __name__ == "__main__":
             best_val_ood_acc_all = val_ood_acc_all
             best_model_all = {f'model_{i+1}': model.state_dict() for i, model in enumerate(training_models)}
             torch.save(best_model_all, best_model_path_all)  # Save the best model checkpoint
+
+        torch.save({'models': [model.state_dict() for model in training_models],
+                    'optimizers': [optimizer.state_dict() for optimizer in optimizers],
+                    'schedulers': [scheduler.state_dict() for scheduler in schedulers]}, last_model_path_all)
 
         # 保存当前 epoch 和 best_val_ood_acc
         with open(start_epoch_file, 'w') as f:
@@ -500,4 +499,4 @@ if __name__ == "__main__":
         device=device
     )
 
-    save_results(metrics_training, "training_models")
+    save_results(metrics_training, exp_name)
